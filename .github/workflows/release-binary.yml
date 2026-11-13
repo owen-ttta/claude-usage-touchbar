@@ -1,0 +1,112 @@
+name: Build release app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 379ce216ff37cad793c512de42c096d812e4eb7d
+          persist-credentials: false
+      - name: Verify source and run offline tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 379ce216ff37cad793c512de42c096d812e4eb7d
+          make test
+          bash -n claude-touchbar.sh
+      - name: Fetch pinned artwork and build universal app
+        shell: bash
+        run: |
+          set -euo pipefail
+          make assets
+          mkdir -p package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS
+          cp Info.plist package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 0.1.9' package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 9' package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/Info.plist
+          clang -fobjc-arc -O2 -Wall -arch x86_64 -arch arm64 -mmacosx-version-min=12.0 -framework Cocoa -F/System/Library/PrivateFrameworks -framework DFRFoundation -o package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar main.m
+          codesign --force --sign - package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app
+          codesign --verify --deep --strict package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app
+          lipo -verify_arch x86_64 arm64 package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar
+          package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar --shot "$RUNNER_TEMP/release-smoke.png" 48 31 92 0 37 Fable
+          test -s "$RUNNER_TEMP/release-smoke.png"
+      - name: Package app and reader installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp claude-touchbar.sh LICENSE README.md SECURITY.md package/ClaudeTouchBar-v0.1.9/
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('package/ClaudeTouchBar-v0.1.9')
+          installer = '''#!/bin/bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          if ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
+            printf 'Xcode Command Line Tools are required for the Python usage reader. Install them before continuing.\n'
+            exit 1
+          fi
+          /usr/bin/python3 -c 'import json, os, stat, urllib.request'
+          test -s claude-touchbar.sh
+          /usr/bin/codesign --verify --deep --strict ClaudeTouchBar.app
+          if [ -e "$HOME/Applications/ClaudeTouchBar.app" ]; then
+            printf 'An app already exists at ~/Applications/ClaudeTouchBar.app. Move it aside before installing.\n'
+            exit 1
+          fi
+          mkdir -p "$HOME/bin" "$HOME/Applications"
+          if [ -e "$HOME/bin/claude-touchbar.sh" ]; then
+            backup="$HOME/bin/claude-touchbar.sh.backup.$(/bin/date +%Y%m%d%H%M%S).$$"
+            cp -p "$HOME/bin/claude-touchbar.sh" "$backup"
+            printf 'Previous reader backed up to %s\n' "$backup"
+          fi
+          /usr/bin/install -m 755 claude-touchbar.sh "$HOME/bin/claude-touchbar.sh"
+          /usr/bin/cmp claude-touchbar.sh "$HOME/bin/claude-touchbar.sh"
+          /usr/bin/ditto ClaudeTouchBar.app "$HOME/Applications/ClaudeTouchBar.app"
+          /usr/bin/codesign --verify --deep --strict "$HOME/Applications/ClaudeTouchBar.app"
+          printf 'Installed. Open ~/Applications/ClaudeTouchBar.app when ready. No app was launched and no login item was added.\n'
+          '''
+          (root / 'Install.command').write_text(installer)
+          (root / 'Install.command').chmod(0o755)
+          (root / 'START-HERE.txt').write_text('''ClaudeTouchBar v0.1.9 - universal macOS app
+
+          Requires a physical Touch Bar, macOS 12+, signed-in Claude Code, and Xcode Command Line Tools for the Python usage reader. No app compilation is needed.
+
+          1. Extract this ZIP.
+          2. Read README.md and SECURITY.md before running anything.
+          3. Run Install.command. It copies the app into ~/Applications and the reader into ~/bin, preserving any existing reader as a timestamped backup. It refuses to overwrite an existing app.
+          4. Open ~/Applications/ClaudeTouchBar.app when ready. Set Touch Bar shows to App Controls in System Settings if needed.
+
+          The installer does not open the app, access Keychain, add login items, or start services. The app's reader accesses the Claude Code-credentials Keychain item when you launch the app; macOS may request permission.
+
+          This is ad-hoc signed, not Developer ID signed or notarized. macOS may block it. Only approve it after checking the release source and checksum. Do not disable Gatekeeper globally.
+
+          Contains Clawd artwork fetched from SHA-256-pinned claudepix sources at build time. Clawd and the artwork belong to Anthropic; the repository MIT license covers code only and grants no artwork rights.
+
+          Built from source commit 379ce216ff37cad793c512de42c096d812e4eb7d. Bundle version metadata is set to 0.1.9 (build 9) during packaging; application logic is unchanged. CI validates offline tests, both executable architectures, the signature and a headless render. No real usage API, Keychain or physical Touch Bar test is performed by CI.
+          ''')
+          assert (root / 'Install.command').stat().st_size > 1000
+          PY
+          bash -n package/ClaudeTouchBar-v0.1.9/Install.command
+          ditto -c -k --sequesterRsrc --keepParent package/ClaudeTouchBar-v0.1.9 ClaudeTouchBar-v0.1.9-universal-macos.zip
+          shasum -a 256 ClaudeTouchBar-v0.1.9-universal-macos.zip > SHA256SUMS.txt
+          mkdir "$RUNNER_TEMP/unzip-check"
+          ditto -x -k ClaudeTouchBar-v0.1.9-universal-macos.zip "$RUNNER_TEMP/unzip-check"
+          codesign --verify --deep --strict "$RUNNER_TEMP/unzip-check/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app"
+          test -x "$RUNNER_TEMP/unzip-check/ClaudeTouchBar-v0.1.9/Install.command"
+          test -s "$RUNNER_TEMP/unzip-check/ClaudeTouchBar-v0.1.9/claude-touchbar.sh"
+      - name: Attach verified files to v0.1.9
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api repos/${{ github.repository }}/git/ref/tags/v0.1.9 --jq .object.sha)" = 379ce216ff37cad793c512de42c096d812e4eb7d
+          gh release upload v0.1.9 ClaudeTouchBar-v0.1.9-universal-macos.zip SHA256SUMS.txt --repo "${{ github.repository }}"
