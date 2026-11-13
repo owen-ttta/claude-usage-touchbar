@@ -36,7 +36,7 @@ jobs:
           clang -fobjc-arc -O2 -Wall -arch x86_64 -arch arm64 -mmacosx-version-min=12.0 -framework Cocoa -F/System/Library/PrivateFrameworks -framework DFRFoundation -o package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar main.m
           codesign --force --sign - package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app
           codesign --verify --deep --strict package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app
-          lipo -verify_arch x86_64 arm64 package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar
+          lipo package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar -verify_arch x86_64 arm64
           package/ClaudeTouchBar-v0.1.9/ClaudeTouchBar.app/Contents/MacOS/ClaudeTouchBar --shot "$RUNNER_TEMP/release-smoke.png" 48 31 92 0 37 Fable
           test -s "$RUNNER_TEMP/release-smoke.png"
       - name: Package app and reader installer
