@@ -17,6 +17,10 @@
 #import <Cocoa/Cocoa.h>
 #import "clawd_presets.h"
 #import <string.h>
+#import <libproc.h>
+#import <sys/sysctl.h>
+#import <sys/stat.h>
+#import <fcntl.h>
 #import "usage_parser.h"
 
 // Mood pools use indices 0...12. Refuse a stale/partial generated header at
@@ -25,23 +29,32 @@ _Static_assert(sizeof(kClawdClips) / sizeof(kClawdClips[0]) == 13,
                "Expected all 13 Clawd clips; regenerate with make assets");
 
 extern void DFRSystemModalShowsCloseBoxWhenFrontMost(BOOL show);
+extern void DFRElementSetControlStripPresenceForIdentifier(NSTouchBarItemIdentifier ident, BOOL present);
+
+@interface NSTouchBarItem (PrivateSPI)
++ (void)addSystemTrayItem:(NSTouchBarItem *)item;
++ (void)removeSystemTrayItem:(NSTouchBarItem *)item;
+@end
 
 @interface NSTouchBar (PrivateSPI)
 + (void)presentSystemModalTouchBar:(NSTouchBar *)bar
                          placement:(long long)placement
           systemTrayItemIdentifier:(NSTouchBarItemIdentifier)ident;
 + (void)dismissSystemModalTouchBar:(NSTouchBar *)bar;
++ (void)minimizeSystemModalTouchBar:(NSTouchBar *)bar;
 @end
 
 static NSTouchBarItemIdentifier const kSceneID = @"local.claude-touchbar.scene";
 static NSTouchBarItemIdentifier const kEscID   = @"local.claude-touchbar.esc";
+static NSTouchBarItemIdentifier const kHideID  = @"local.claude-touchbar.hide";
+static NSTouchBarItemIdentifier const kTrayID  = @"local.claude-touchbar.tray";
 static NSString *const kScript = @"~/bin/claude-touchbar.sh --raw";
 
 // Measured with `make ruler`, which draws ticks at fixed coordinates: the last
 // legible label is 600, so that is the usable width beside the Control Strip.
 // The window reports 685pt, but part of that is never presented — trusting the
 // window figure clipped the third readout cell clean off.
-static CGFloat const kSceneW = 600.0;
+static CGFloat const kSceneW = 552.0;   // 600 is the max usable; kept compact so it sits left
 static CGFloat const kSceneH = 30.0;
 static double  const kFPS    = 15.0;    // both reference pet apps land at 14-18
 
@@ -50,7 +63,8 @@ static double  const kFPS    = 15.0;    // both reference pet apps land at 14-18
 // 5h and 7d a row each and demoted the per-model cap to a bare number with no
 // bar, which made the one number you could not compare the odd one out.
 #define READ_W    300.0
-#define READ_X    (kSceneW - READ_W - 8)   // right-aligned: usage is the thing
+#define INFO_W    72.0                     // model / effort column, far right
+#define READ_X    (kSceneW - READ_W - INFO_W - 18)   // right-aligned: usage is the thing
                                            // you look for, so it sits where the
                                            // eye lands last and stays put
 #define CELL_GAP    9.0
@@ -116,6 +130,9 @@ static int ClipForMood(Mood m, int previous) {
 @property (nonatomic) int p5, p7, resetMin, ageSec, scopedPct;
 @property (nonatomic, copy) NSString *scopedName;   // per-model weekly cap (e.g. Fable)
 @property (nonatomic, copy) NSString *state;   // ok | stale | expired | none
+@property (nonatomic, copy) NSString *modelName, *effort;   // from the statusline bridge
+@property (nonatomic) BOOL modelStale;
+@property (nonatomic) long reset5At, reset7At;   // epoch seconds, from the statusline bridge (0 = unknown)
 @property (nonatomic) CGFloat x, dir, phase;
 @property (nonatomic) BOOL haveData;
 @property (nonatomic) Act act;
@@ -434,9 +451,24 @@ static void DrawGrid(const unsigned char *g, NSPoint origin, CGFloat px,
     // Sit him slightly low: the space above his head is where the sweat goes.
     NSPoint feet = NSMakePoint(self.x, 2.2 + bob);   // 2.2 clears the ground line at feet.y-1.5
 
-    // Ground line, like the reference art.
-    [[NSColor colorWithWhite:1.0 alpha:0.14] set];
-    NSRectFill(NSMakeRect(0, feet.y - 1.5, NSWidth(self.bounds), 1.0));
+    // Ground line: fades out at both ends instead of stopping dead, with a warm
+    // pool of light under Clawd that follows him (and goes red when he panics).
+    {
+        CGFloat gy = feet.y - 1.5, gw = READ_X - 6.0;
+        NSGradient *line = [[NSGradient alloc] initWithColorsAndLocations:
+            [NSColor colorWithWhite:1.0 alpha:0.0], 0.0,
+            [NSColor colorWithWhite:1.0 alpha:0.16], 0.25,
+            [NSColor colorWithWhite:1.0 alpha:0.16], 0.75,
+            [NSColor colorWithWhite:1.0 alpha:0.0], 1.0, nil];
+        [line drawInRect:NSMakeRect(0, gy, gw, 1.0) angle:0];
+        CGFloat cx = self.x;   // feet.x is his centre
+        NSGradient *pool = [[NSGradient alloc] initWithStartingColor:[body colorWithAlphaComponent:0.55]
+                                                         endingColor:[body colorWithAlphaComponent:0.0]];
+        [pool drawInRect:NSMakeRect(cx - 26, gy - 0.5, 52, 2.0) relativeCenterPosition:NSZeroPoint];
+        NSGradient *halo = [[NSGradient alloc] initWithStartingColor:[body colorWithAlphaComponent:0.16]
+                                                         endingColor:[body colorWithAlphaComponent:0.0]];
+        [halo drawInRect:NSMakeRect(cx - 30, gy - 6, 60, 22) relativeCenterPosition:NSMakePoint(0, -0.6)];
+    }
 
     // Panic: motion streaks trailing behind.
     if (mood == MoodPanic) {
@@ -509,6 +541,50 @@ static void DrawGrid(const unsigned char *g, NSPoint origin, CGFloat px,
     }
 
     [self drawReadout];
+    [self drawInfo];
+}
+
+// Model on top, effort underneath, one column at the far right.
+- (void)drawInfo {
+    if (!self.modelName.length) return;
+    CGFloat x = kSceneW - INFO_W - 4, h = NSHeight(self.bounds);
+    CGFloat a = self.modelStale ? 0.5 : 1.0;
+
+    // Hairline divider between the usage cells and this column.
+    [[NSColor colorWithWhite:1.0 alpha:0.16] set];
+    NSRectFill(NSMakeRect(x - 8, 5, 1, h - 10));
+
+    NSFont *(^rounded)(CGFloat, NSFontWeight) = ^NSFont *(CGFloat size, NSFontWeight wt) {
+        NSFont *f = [NSFont systemFontOfSize:size weight:wt];
+        NSFontDescriptor *d = [f.fontDescriptor fontDescriptorWithDesign:NSFontDescriptorSystemDesignRounded];
+        return (d ? [NSFont fontWithDescriptor:d size:size] : nil) ?: f;
+    };
+    NSColor *coral = [NSColor colorWithSRGBRed:0.918 green:0.600 blue:0.506 alpha:a];
+
+    NSShadow *glow = [NSShadow new];
+    glow.shadowOffset = NSZeroSize; glow.shadowBlurRadius = 3.0;
+    glow.shadowColor = [coral colorWithAlphaComponent:0.45 * a];
+    NSDictionary *mt = @{ NSFontAttributeName: rounded(11.5, NSFontWeightHeavy),
+                          NSForegroundColorAttributeName: coral, NSShadowAttributeName: glow };
+    NSString *m = self.modelName;
+    while (m.length > 1 && [m sizeWithAttributes:mt].width > INFO_W) m = [m substringToIndex:m.length - 1];
+    [m drawAtPoint:NSMakePoint(x, TEXT_Y - 1.5) withAttributes:mt];
+
+    // Effort: five pips (low..max) and the word.
+    NSArray *levels = @[@"low", @"medium", @"high", @"xhigh", @"max"];
+    NSUInteger lv = [levels indexOfObject:self.effort.lowercaseString];
+    NSInteger filled = (lv == NSNotFound) ? 0 : (NSInteger)lv + 1;
+    for (NSInteger i = 0; i < 5; i++) {
+        NSRect r = NSMakeRect(x + i * 5.0, BAR_Y + 1.5, 3.5, 5.0);
+        [(i < filled ? [coral colorWithAlphaComponent:0.95 * a]
+                     : [NSColor colorWithWhite:1.0 alpha:0.18 * a]) set];
+        [[NSBezierPath bezierPathWithRoundedRect:r xRadius:1.2 yRadius:1.2] fill];
+    }
+    NSString *ew = (lv == NSNotFound) ? (self.effort.length ? self.effort : @"–")
+                 : @[@"low", @"med", @"high", @"xhigh", @"max"][lv];
+    NSDictionary *et = @{ NSFontAttributeName: rounded(9.5, NSFontWeightBold),
+                          NSForegroundColorAttributeName: [NSColor colorWithWhite:1.0 alpha:0.62 * a] };
+    [ew drawAtPoint:NSMakePoint(x + 28, BAR_Y - 1.5) withAttributes:et];
 }
 
 static void DrawRight(NSString *s, CGFloat rightEdge, CGFloat y, NSDictionary *at) {
@@ -556,22 +632,43 @@ static void DrawRight(NSString *s, CGFloat rightEdge, CGFloat y, NSDictionary *a
                      x:READ_X + i * (cellW + CELL_GAP) width:cellW dim:dim];
     }
 
-    // The countdown belongs to the 5h window, so it sits beside that label
-    // rather than in a row of its own. Staleness takes the same slot when it
-    // applies — an old reading matters more than when the next one resets.
-    NSString *note = nil;
-    NSColor *noteColor = [NSColor colorWithWhite:1.0 alpha:0.55];
+    // Reset countdowns, small, beside each label: 5h from the usage script,
+    // 7d from the statusline bridge (the script only reports the 5h reset).
+    // Staleness takes the 5h slot when it applies — an old reading matters
+    // more than when the next one resets.
+    NSDictionary *(^noteAt)(NSColor *) = ^NSDictionary *(NSColor *c) {
+        return @{ NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:8 weight:NSFontWeightMedium],
+                  NSForegroundColorAttributeName: c };
+    };
+    NSString *(^span)(long) = ^NSString *(long mins) {
+        if (mins >= 24 * 60) return [NSString stringWithFormat:@"%ldd%02ldh", mins / 1440, (mins % 1440) / 60];
+        return [NSString stringWithFormat:@"%ldh%02ld", mins / 60, mins % 60];
+    };
+    NSColor *soft = [NSColor colorWithWhite:1.0 alpha:0.55 * dim];
+    long nowS = (long)time(NULL);
+
+    // The 5h reset is a fixed moment, so it stays right even when the usage
+    // reading is old: prefer the bridge's absolute time, else age the cached
+    // countdown by how old the reading is. When the reading is stale, the
+    // slot alternates (every 3s) between the reset and "Xm old" in amber, so
+    // the warning is still spelled out without hiding the reset.
+    long r5 = -1;
+    if (self.reset5At > nowS)       r5 = (self.reset5At - nowS + 59) / 60;
+    else if (self.resetMin >= 0)    r5 = MAX(0L, (long)self.resetMin - (old ? self.ageSec / 60 : 0));
+
+    NSString *note = (r5 >= 0) ? span(r5) : nil;
+    NSColor *noteColor = soft;
     if (old) {
-        note = [NSString stringWithFormat:@"%dm old", self.ageSec / 60];
-        noteColor = [NSColor colorWithSRGBRed:1.0 green:0.78 blue:0.31 alpha:0.95];
-    } else if (self.resetMin >= 0) {
-        note = [NSString stringWithFormat:@"%dh%02d", self.resetMin / 60, self.resetMin % 60];
+        NSColor *amber = [NSColor colorWithSRGBRed:1.0 green:0.78 blue:0.31 alpha:0.95];
+        BOOL showAge = !note || ((long)(NSProcessInfo.processInfo.systemUptime / 3.0) % 2 == 1);
+        if (showAge) note = [NSString stringWithFormat:@"%dm old", self.ageSec / 60];
+        noteColor = amber;
     }
-    if (note) {
-        NSDictionary *at = @{ NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:8
-                                                                                    weight:NSFontWeightMedium],
-                              NSForegroundColorAttributeName: noteColor };
-        [note drawAtPoint:NSMakePoint(READ_X + 17, TEXT_Y + 1) withAttributes:at];
+    if (note) [note drawAtPoint:NSMakePoint(READ_X + 17, TEXT_Y + 1) withAttributes:noteAt(noteColor)];
+
+    if (self.reset7At > nowS) {
+        NSString *n7 = span((self.reset7At - nowS + 59) / 60);
+        [n7 drawAtPoint:NSMakePoint(READ_X + cellW + CELL_GAP + 16, TEXT_Y + 1) withAttributes:noteAt(soft)];
     }
 }
 
@@ -581,50 +678,103 @@ static void DrawRight(NSString *s, CGFloat rightEdge, CGFloat y, NSDictionary *a
 // green and 71% amber?). Colour is spent only on the one state that needs an
 // action — at or above 90% — so it reads as an alarm rather than decoration.
 - (void)drawCell:(NSString *)label pct:(int)pct x:(CGFloat)x width:(CGFloat)w dim:(CGFloat)dim {
-    // #B1B9F9 is the exact colour Claude Code fills its own /usage bars with —
-    // read off the escape codes it emits, not guessed. Amber and red take over
-    // as the window fills. Coral is deliberately absent: it is Clawd's, and at
-    // 1.08:1 against a warning red it could not carry a warning anyway.
-    //
-    // Thresholds are visible on the bar itself (ticks at 50 and 90), so a
-    // change of colour lands where the user can see why, and ">= 90" also
-    // prints "!" so the alarm never depends on colour vision alone.
-    // Picked on the Touch Bar itself via `--palette`, not from renders. Claude
-    // Code's own #B1B9F9 was the starting point and lost: hue 233 reads as
-    // lavender and L84 washes out on a 30pt strip you glance at. A panel this
-    // dim wants more saturation and less lightness than a terminal does.
+    // Same thresholds and meaning as before (blue < 50, amber >= 50, red >= 90,
+    // ticks at 50/90, "!" glyph so the alarm never relies on colour alone).
+    // Only the rendering is new: capsule bars, a lit gradient, a glow, a slow
+    // shimmer, and a pulse on the alarm state.
     BOOL alarm = (pct >= 90);
-    NSColor *ink;
-    if (alarm)          ink = [NSColor colorWithSRGBRed:0.902 green:0.208 blue:0.180 alpha:1.0];  // #E6352E
-    else if (pct >= 50) ink = [NSColor colorWithSRGBRed:0.949 green:0.706 blue:0.161 alpha:1.0];  // #F2B429
-    else                ink = [NSColor colorWithSRGBRed:0.173 green:0.533 blue:0.945 alpha:1.0];  // #2C88F1
+    NSColor *ink, *hi;
+    if (alarm)          { ink = [NSColor colorWithSRGBRed:0.902 green:0.208 blue:0.180 alpha:1.0];   // #E6352E
+                          hi  = [NSColor colorWithSRGBRed:1.000 green:0.478 blue:0.400 alpha:1.0]; }
+    else if (pct >= 50) { ink = [NSColor colorWithSRGBRed:0.949 green:0.706 blue:0.161 alpha:1.0];   // #F2B429
+                          hi  = [NSColor colorWithSRGBRed:1.000 green:0.878 blue:0.459 alpha:1.0]; }
+    else                { ink = [NSColor colorWithSRGBRed:0.173 green:0.533 blue:0.945 alpha:1.0];   // #2C88F1
+                          hi  = [NSColor colorWithSRGBRed:0.400 green:0.851 blue:1.000 alpha:1.0]; }
 
-    NSDictionary *lb = @{ NSFontAttributeName: [NSFont systemFontOfSize:10 weight:NSFontWeightSemibold],
-                          NSForegroundColorAttributeName: [NSColor colorWithWhite:1.0 alpha:0.70 * dim] };
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    CGFloat pulse = alarm ? (0.5 + 0.5 * sin(now * 4.0)) : 0.0;
+
+    NSFont *(^rounded)(CGFloat, NSFontWeight, BOOL) = ^NSFont *(CGFloat size, NSFontWeight wt, BOOL digits) {
+        NSFont *f = digits ? [NSFont monospacedDigitSystemFontOfSize:size weight:wt]
+                           : [NSFont systemFontOfSize:size weight:wt];
+        NSFontDescriptor *d = [f.fontDescriptor fontDescriptorWithDesign:NSFontDescriptorSystemDesignRounded];
+        return (d ? [NSFont fontWithDescriptor:d size:size] : nil) ?: f;
+    };
+
+    NSDictionary *lb = @{ NSFontAttributeName: rounded(10, NSFontWeightHeavy, NO),
+                          NSForegroundColorAttributeName: [NSColor colorWithWhite:1.0 alpha:0.62 * dim],
+                          NSKernAttributeName: @0.4 };
     [label drawAtPoint:NSMakePoint(x, TEXT_Y) withAttributes:lb];
 
-    // Every percentage is the same size and weight — one glance, one scale.
+    // Number with a coloured glow behind it.
     NSString *num = alarm ? [NSString stringWithFormat:@"%d%% !", pct]
                           : [NSString stringWithFormat:@"%d%%", pct];
-    NSDictionary *nu = @{ NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:12
-                                                                                weight:NSFontWeightBold],
-                          NSForegroundColorAttributeName: [ink colorWithAlphaComponent:dim] };
-    DrawRight(num, x + w, TEXT_Y - 1, nu);
+    NSShadow *glow = [NSShadow new];
+    glow.shadowOffset = NSZeroSize;
+    glow.shadowBlurRadius = alarm ? 3.0 + 3.0 * pulse : 3.0;
+    glow.shadowColor = [hi colorWithAlphaComponent:(alarm ? 0.55 + 0.4 * pulse : 0.45) * dim];
+    NSDictionary *nu = @{ NSFontAttributeName: rounded(12.5, NSFontWeightHeavy, YES),
+                          NSForegroundColorAttributeName: [hi colorWithAlphaComponent:dim],
+                          NSShadowAttributeName: glow };
+    DrawRight(num, x + w, TEXT_Y - 1.5, nu);
 
-    // The track is the 100% reference, not decoration — keep it readable.
-    [[NSColor colorWithWhite:1.0 alpha:0.36 * dim] set];
-    NSRectFill(NSMakeRect(x, BAR_Y, w, BAR_H));
+    // Track: recessed capsule with a faint inner edge.
+    CGFloat r = BAR_H / 2.0;
+    NSRect track = NSMakeRect(x, BAR_Y, w, BAR_H);
+    NSBezierPath *trackPath = [NSBezierPath bezierPathWithRoundedRect:track xRadius:r yRadius:r];
+    [[NSColor colorWithWhite:1.0 alpha:0.13 * dim] set];
+    [trackPath fill];
+    [[NSColor colorWithWhite:1.0 alpha:0.22 * dim] set];
+    trackPath.lineWidth = 0.6;
+    [trackPath stroke];
 
     CGFloat fillW = w * pct / 100.0;
-    [[ink colorWithAlphaComponent:dim] set];
-    NSRectFill(NSMakeRect(x, BAR_Y, fillW, BAR_H));
+    if (fillW > 0.5) {
+        NSRect fr = NSMakeRect(x, BAR_Y, MAX(fillW, BAR_H), BAR_H);
+        NSBezierPath *fp = [NSBezierPath bezierPathWithRoundedRect:fr xRadius:r yRadius:r];
 
-    // Ticks at 50 and 90 turn the bar into a scale, drawn only over the unfilled
-    // remainder — notches punched through a nearly-full bar read as breakage.
-    [[NSColor colorWithWhite:1.0 alpha:0.3 * dim] set];
+        // Glow under the fill.
+        [NSGraphicsContext saveGraphicsState];
+        NSShadow *bg = [NSShadow new];
+        bg.shadowOffset = NSZeroSize;
+        bg.shadowBlurRadius = alarm ? 4.0 + 4.0 * pulse : 4.0;
+        bg.shadowColor = [ink colorWithAlphaComponent:(alarm ? 0.6 + 0.4 * pulse : 0.6) * dim];
+        [bg set];
+        [[ink colorWithAlphaComponent:dim] set];
+        [fp fill];
+        [NSGraphicsContext restoreGraphicsState];
+
+        // Horizontal gradient (deep -> bright toward the leading edge) clipped
+        // to the capsule, then a glossy top highlight and a moving shimmer.
+        [NSGraphicsContext saveGraphicsState];
+        [fp addClip];
+        NSGradient *g = [[NSGradient alloc] initWithStartingColor:[ink colorWithAlphaComponent:dim]
+                                                      endingColor:[hi colorWithAlphaComponent:dim]];
+        [g drawInRect:fr angle:0];
+        NSGradient *gloss = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithWhite:1.0 alpha:0.0]
+                                                          endingColor:[NSColor colorWithWhite:1.0 alpha:0.35 * dim]];
+        [gloss drawInRect:NSMakeRect(fr.origin.x, BAR_Y + BAR_H * 0.5, fr.size.width, BAR_H * 0.5) angle:90];
+
+        CGFloat period = 2.8, sw = 26.0;
+        CGFloat t = fmod(now + x * 0.004, period) / period;   // cells slightly out of step
+        CGFloat sx = fr.origin.x - sw + t * (fr.size.width + sw * 2);
+        NSGradient *shine = [[NSGradient alloc] initWithColorsAndLocations:
+            [NSColor colorWithWhite:1.0 alpha:0.0], 0.0,
+            [NSColor colorWithWhite:1.0 alpha:0.38 * dim], 0.5,
+            [NSColor colorWithWhite:1.0 alpha:0.0], 1.0, nil];
+        [shine drawInRect:NSMakeRect(sx, BAR_Y, sw, BAR_H) angle:0];
+        [NSGraphicsContext restoreGraphicsState];
+
+        // Bright cap at the leading edge.
+        [[hi colorWithAlphaComponent:0.9 * dim] set];
+        NSRectFill(NSMakeRect(x + MAX(fillW, BAR_H) - 1.2, BAR_Y + 1.5, 1.2, BAR_H - 3.0));
+    }
+
+    // Ticks at 50 and 90, only over the unfilled remainder.
+    [[NSColor colorWithWhite:1.0 alpha:0.38 * dim] set];
     for (NSNumber *frac in @[@0.5, @0.9]) {
         CGFloat tx = w * frac.doubleValue;
-        if (tx > fillW) NSRectFill(NSMakeRect(x + tx, BAR_Y, 1, BAR_H));
+        if (tx > fillW + 1) NSRectFill(NSMakeRect(x + tx, BAR_Y + 1.5, 1, BAR_H - 3.0));
     }
 }
 
@@ -803,6 +953,16 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
 @property (nonatomic) NSTimeInterval lastFrame;
 @property (nonatomic) NSTimeInterval lastPoll;
 @property (nonatomic) BOOL polling, asleep, dark;
+// User tapped "hide": give the Touch Bar back to the system (emoji picker,
+// typing suggestions, app controls) until the Control Strip icon is tapped.
+@property (nonatomic) BOOL hiddenByUser;     // effective: widget is not on screen
+// Auto mode: show only while Claude is in front — the desktop app, or a
+// terminal/editor that has a `claude` CLI process running under it.
+@property (nonatomic) pid_t frontPID;
+@property (nonatomic) NSInteger manual;       // 0 auto, 1 forced show, -1 forced hide (until next app switch)
+@property (nonatomic) NSTimeInterval lastContextCheck;
+@property (nonatomic, strong) NSCustomTouchBarItem *tray;
+@property (nonatomic, strong) NSButton *trayButton;
 @end
 
 @implementation AppDelegate
@@ -833,11 +993,21 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
 
     self.bar = [NSTouchBar new];
     self.bar.delegate = self;
-    self.bar.defaultItemIdentifiers = @[kSceneID];
-    // Keep Esc working — a presented bar otherwise covers the system one.
-    self.bar.escapeKeyReplacementItemIdentifier = kEscID;
+    self.bar.defaultItemIdentifiers = @[kHideID, kSceneID];
 
-    [self present];
+    // Control Strip icon: always there, shows the 5h figure, and toggles the
+    // widget. Hiding it is what lets the emoji / suggestion bar come through.
+    self.trayButton = [NSButton buttonWithTitle:@"◐" target:self action:@selector(toggleWidget:)];
+    self.trayButton.bezelColor = [NSColor colorWithSRGBRed:0.804 green:0.498 blue:0.416 alpha:0.55];
+    self.tray = [[NSCustomTouchBarItem alloc] initWithIdentifier:kTrayID];
+    self.tray.view = self.trayButton;
+    if ([NSTouchBarItem respondsToSelector:@selector(addSystemTrayItem:)]) {
+        [NSTouchBarItem addSystemTrayItem:self.tray];
+        DFRElementSetControlStripPresenceForIdentifier(kTrayID, YES);
+    }
+
+    self.hiddenByUser = YES;          // start hidden; the context check decides
+    [self refreshContext:YES];
 
     // App Nap will freeze the animation the moment you switch away, which is
     // precisely when the pet is worth watching. Do not prevent idle sleep.
@@ -853,7 +1023,7 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
     // A presented bar yields when another app presents its own, so re-assert on
     // every app switch. Cheap and idempotent.
     [NSWorkspace.sharedWorkspace.notificationCenter
-        addObserver:self selector:@selector(present)
+        addObserver:self selector:@selector(appActivated:)
                name:NSWorkspaceDidActivateApplicationNotification object:nil];
 
     // Don't animate into a locked screen.
@@ -874,11 +1044,155 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
 }
 
 - (void)present {
-    [NSTouchBar presentSystemModalTouchBar:self.bar placement:0 systemTrayItemIdentifier:nil];
+    if (self.hiddenByUser) return;
+    NSTouchBarItemIdentifier tray = self.tray ? kTrayID : nil;
+    [NSTouchBar presentSystemModalTouchBar:self.bar placement:0 systemTrayItemIdentifier:tray];
+}
+
+// Claude Code's native build runs as ~/.local/share/claude/versions/<ver>,
+// so its process name is the version number, not "claude". Match the
+// executable path, and for npm installs (node) look for claude-code in argv.
+static BOOL IsClaudeProcess(pid_t pid) {
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_pidpath(pid, path, sizeof path) <= 0) return NO;
+    const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+    if (strcmp(base, "claude") == 0 || strstr(path, "/claude/versions/")) return YES;
+    if (strcmp(base, "node") != 0 && strcmp(base, "bun") != 0) return NO;
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
+    char args[8192]; size_t len = sizeof args;
+    if (sysctl(mib, 3, args, &len, NULL, 0) != 0 || len <= sizeof(int)) return NO;
+    for (size_t i = sizeof(int); i < len; i += strlen(args + i) + 1) {
+        if (strstr(args + i, "claude-code")) return YES;
+        if (i + 1 >= len) break;
+    }
+    return NO;
+}
+
+// Parent pid via sysctl: works for root-owned links in the chain (Terminal
+// runs shells under /usr/bin/login), where proc_pidinfo is refused.
+static pid_t ParentOf(pid_t pid) {
+    struct kinfo_proc k; size_t len = sizeof k;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    if (sysctl(mib, 4, &k, &len, NULL, 0) != 0 || len == 0) return 0;
+    return k.kp_eproc.e_ppid;
+}
+
+// Is a Claude Code CLI running anywhere under `ancestor` (a terminal or
+// editor)? Local process table only — no sockets, no extra permissions.
+static BOOL ClaudeRunsUnder(pid_t ancestor) {
+    if (ancestor <= 1) return NO;
+    int n = proc_listallpids(NULL, 0);
+    if (n <= 0) return NO;
+    pid_t *pids = calloc((size_t)n + 64, sizeof(pid_t));
+    if (!pids) return NO;
+    n = proc_listallpids(pids, (int)(((size_t)n + 64) * sizeof(pid_t)));
+    BOOL found = NO;
+    for (int i = 0; i < n && !found; i++) {
+        if (pids[i] <= 1 || !IsClaudeProcess(pids[i])) continue;
+        pid_t p = pids[i];
+        for (int depth = 0; depth < 32 && p > 1; depth++) {
+            p = ParentOf(p);
+            if (p == ancestor) { found = YES; break; }
+        }
+    }
+    free(pids);
+    return found;
+}
+
+// ~/.claude-usage-touchbar/model is written by the statusline bridge as
+// "<effort>\t<model>\n". Same guards as the usage cache: no symlinks, no
+// FIFOs, owned by us, tiny, and every character whitelisted.
+- (void)readModel {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@".claude-usage-touchbar/model"];
+    int fd = open(dir.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return;
+    struct stat st;
+    char buf[129] = {0};
+    ssize_t n = -1;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == getuid() && st.st_size <= 128)
+        n = read(fd, buf, 128);
+    close(fd);
+    if (n <= 0) return;
+    NSString *line = [[[NSString alloc] initWithBytes:buf length:(NSUInteger)n encoding:NSUTF8StringEncoding]
+                      stringByTrimmingCharactersInSet:NSCharacterSet.newlineCharacterSet];
+    NSArray *parts = [line componentsSeparatedByString:@"\t"];
+    if (parts.count != 2 && parts.count != 4) return;
+    long r5 = 0, r7 = 0;
+    if (parts.count == 4) {
+        NSCharacterSet *nd = NSCharacterSet.decimalDigitCharacterSet.invertedSet;
+        for (NSString *p in @[parts[2], parts[3]])
+            if (p.length == 0 || p.length > 11 || [p rangeOfCharacterFromSet:nd].location != NSNotFound) return;
+        r5 = (long)[parts[2] longLongValue]; r7 = (long)[parts[3] longLongValue];
+        parts = [parts subarrayWithRange:NSMakeRange(0, 2)];
+    }
+    NSCharacterSet *bad = [[NSCharacterSet characterSetWithCharactersInString:
+        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._-"] invertedSet];
+    for (NSString *p in parts)
+        if (p.length == 0 || p.length > 24 || [p rangeOfCharacterFromSet:bad].location != NSNotFound) return;
+    self.pet.effort = parts[0];
+    self.pet.modelName = parts[1];
+    self.pet.reset5At = r5; self.pet.reset7At = r7;
+    self.pet.modelStale = (time(NULL) - st.st_mtime) > 6 * 3600;   // no session for hours
+}
+
+- (BOOL)claudeInFront {
+    NSRunningApplication *app = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (!app) return NO;
+    if ([app.bundleIdentifier hasPrefix:@"com.anthropic."]) return YES;   // Claude desktop
+    return ClaudeRunsUnder(app.processIdentifier);
+}
+
+- (void)appActivated:(NSNotification *)note { [self refreshContext:YES]; }
+
+// Decide whether the widget should be up. A manual toggle holds until the
+// front app changes; then it is back to auto.
+- (void)refreshContext:(BOOL)reassert {
+    pid_t front = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    if (front != self.frontPID) { self.frontPID = front; self.manual = 0; }
+    BOOL want = self.manual ? (self.manual > 0) : [self claudeInFront];
+    if (want && (self.hiddenByUser || reassert)) {
+        self.hiddenByUser = NO;
+        self.lastFrame = NSDate.timeIntervalSinceReferenceDate;
+        [self present];
+    } else if (!want && !self.hiddenByUser) {
+        [self hideWidget:nil];
+    }
+}
+
+- (void)hideWidget:(id)sender {
+    if (sender) self.manual = -1;
+    self.hiddenByUser = YES;
+    if ([NSTouchBar respondsToSelector:@selector(minimizeSystemModalTouchBar:)])
+        [NSTouchBar minimizeSystemModalTouchBar:self.bar];
+    else
+        [NSTouchBar dismissSystemModalTouchBar:self.bar];
+}
+
+- (void)toggleWidget:(id)sender {
+    if (self.hiddenByUser) { self.manual = 1; self.hiddenByUser = NO; [self present]; }
+    else                   { [self hideWidget:sender]; }
+}
+
+- (void)updateTray {
+    if (!self.trayButton) return;
+    NSString *st = self.pet.state ?: @"none";
+    NSString *title; NSColor *tint;
+    if (!self.pet.haveData)                    { title = @"◐";  tint = nil; }
+    else if ([st isEqualToString:@"expired"]) { title = @"!";  tint = [NSColor colorWithSRGBRed:0.902 green:0.208 blue:0.180 alpha:0.8]; }
+    else {
+        int p = MAX(0, MIN(100, self.pet.p5));
+        title = [NSString stringWithFormat:@"%d%%", p];
+        tint = (p >= 90) ? [NSColor colorWithSRGBRed:0.902 green:0.208 blue:0.180 alpha:0.8]
+             : (p >= 50) ? [NSColor colorWithSRGBRed:0.949 green:0.706 blue:0.161 alpha:0.7]
+                         : [NSColor colorWithSRGBRed:0.173 green:0.533 blue:0.945 alpha:0.7];
+    }
+    self.trayButton.title = title;
+    self.trayButton.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightBold];
+    if (tint) self.trayButton.bezelColor = tint;
 }
 
 - (void)sleep { self.asleep = YES; }
-- (void)wake  { self.asleep = NO; [self present]; }
+- (void)wake  { self.asleep = NO; [self refreshContext:YES]; }
 - (void)screensSlept:(NSNotification *)note { self.dark = YES; }
 - (void)screensWoke:(NSNotification *)note {
     self.dark = NO;
@@ -897,6 +1211,15 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
             it.view = [[PaletteView alloc] initWithFrame:NSMakeRect(0, 0, kSceneW, kSceneH)];
         else
             it.view = self.pet;
+        return it;
+    }
+    if ([identifier isEqualToString:kHideID]) {
+        NSCustomTouchBarItem *it = [[NSCustomTouchBarItem alloc] initWithIdentifier:identifier];
+        NSImage *img = [NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:@"Hide"];
+        NSButton *b = img ? [NSButton buttonWithImage:img target:self action:@selector(hideWidget:)]
+                          : [NSButton buttonWithTitle:@"⌄" target:self action:@selector(hideWidget:)];
+        [b.widthAnchor constraintEqualToConstant:30].active = YES;
+        it.view = b;
         return it;
     }
     if ([identifier isEqualToString:kEscID]) {
@@ -924,6 +1247,15 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
     NSTimeInterval dt = MIN(now - self.lastFrame, 0.25);   // clamp after a stall
     self.lastFrame = now;
 
+    if (now - self.lastContextCheck >= 1.5) {  // catches `claude` started/quit in place
+        self.lastContextCheck = now;
+        [self readModel];
+        [self refreshContext:NO];
+    }
+    if (self.hiddenByUser) {                  // nothing on screen: just keep polling
+        if (now - self.lastPoll >= 30.0) { self.lastPoll = now; [self poll]; }
+        return;
+    }
     [self.pet advance:dt];
 
     if (now - self.lastPoll >= 30.0) { self.lastPoll = now; [self poll]; }
@@ -966,6 +1298,7 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
                 self.pet.scopedPct = reading.scopedPct;
                 self.pet.scopedName = [NSString stringWithUTF8String:reading.scopedName];
                 self.pet.haveData = strcmp(reading.state, "none") != 0;
+                [self updateTray];
             }
             self.polling = NO;
         });
@@ -974,6 +1307,8 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
 
 - (void)applicationWillTerminate:(NSNotification *)note {
     [NSTouchBar dismissSystemModalTouchBar:self.bar];
+    if (self.tray && [NSTouchBarItem respondsToSelector:@selector(removeSystemTrayItem:)])
+        [NSTouchBarItem removeSystemTrayItem:self.tray];
     if (self.activity) [NSProcessInfo.processInfo endActivity:self.activity];
 }
 
@@ -999,6 +1334,8 @@ static int RenderStates(NSString *dir) {
     for (NSString *name in [states.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
         NSArray *s = states[name];
         PetView *v = [[PetView alloc] initWithFrame:NSMakeRect(0, 0, kSceneW, kSceneH)];
+        v.modelName = @"Opus 5.5"; v.effort = @"high";   // so --render shows the column
+        v.reset7At = (long)time(NULL) + 2 * 86400 + 14 * 3600;
         v.p5 = [s[0] intValue]; v.p7 = [s[1] intValue]; v.resetMin = [s[2] intValue];
         v.state = s[3]; v.scopedPct = [s[4] intValue]; v.scopedName = s[5];
         v.ageSec = 300; v.haveData = YES; v.x = 60;

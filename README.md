@@ -109,6 +109,33 @@ Nothing you can build a pose library from is in this repository — the demo
 recording at the top is a screenshot of the running widget, the same as any
 project showing its own UI.
 
+## What's on the bar
+
+- **Usage cells** — 5h, 7d (and a per-model cap once used), each with a small
+  reset countdown beside the label. Capsule bars glow, shimmer, and pulse red
+  at 90%+.
+- **Model / effort column** on the far right: model name on top, effort level
+  (five pips, low → max) underneath.
+- **Shows only while Claude is in front** — the Claude desktop app, or a
+  terminal/editor with a `claude` CLI process under it. Everywhere else the
+  normal Touch Bar (emoji picker, typing suggestions) is left alone.
+- **⌄ button** hides the widget; the **Control Strip icon** (shows the 5h %)
+  toggles it. A manual toggle lasts until you switch apps.
+
+### Model, effort and 7d reset: the statusline bridge
+
+The usage endpoint does not report the current model or effort, so these come
+from Claude Code's status line JSON. Add one line to your status line script,
+right after it reads its input:
+
+```bash
+input=$(cat)
+printf '%s' "$input" | ~/bin/claude-touchbar-bridge.sh
+```
+
+It writes only effort, model name and the two reset times to
+`~/.claude-usage-touchbar/model`. Without it the column is simply absent.
+
 ## Run it at login
 
 ```bash

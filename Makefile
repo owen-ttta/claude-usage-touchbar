@@ -20,7 +20,8 @@ all: $(BIN)
 install-script:
 	@mkdir -p $(HOME)/bin
 	@install -m 755 claude-touchbar.sh $(HOME)/bin/claude-touchbar.sh
-	@echo "installed $(HOME)/bin/claude-touchbar.sh"
+	@install -m 755 tools/statusline-bridge.sh $(HOME)/bin/claude-touchbar-bridge.sh
+	@echo "installed $(HOME)/bin/claude-touchbar.sh and claude-touchbar-bridge.sh"
 
 # Clawd's pose data is not redistributed — pull it onto this machine first.
 assets:
